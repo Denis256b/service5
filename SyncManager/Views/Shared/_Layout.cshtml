@@ -1,0 +1,43 @@
+﻿<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@ViewData["Title"] — Демон Синхронизации</title>
+    <link rel="stylesheet" href="~/lib/bootstrap/dist/css/bootstrap.min.css" />
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.11/css/dataTables.bootstrap5.min.css" />
+    <link rel="stylesheet" href="~/css/site.css" asp-append-version="true" />
+</head>
+<body>
+    <div class="container-fluid px-4">
+        <nav class="navbar navbar-expand-lg navbar-dark bg-primary mb-4">
+            <div class="container-fluid">
+                <a class="navbar-brand" href="/">⚙️ Демон Синхронизации</a>
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" asp-controller="Sync" asp-action="Dashboard">Синхронизация</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/reports">Отчёты</a>
+                    </li>
+                </ul>
+                <span class="navbar-text me-3">
+                    <a href="#" id="notifyToggle" class="navbar-text text-decoration-none" title="Десктоп-уведомления об ошибках">🔔 Уведомления</a>
+                </span>
+                <span class="navbar-text">
+                    👤 <span id="currentUserName">@User.Identity?.Name</span>
+                </span>
+            </div>
+        </nav>
+        @RenderBody()
+    </div>
+    <script src="~/lib/jquery/dist/jquery.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.11/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.11/js/dataTables.bootstrap5.min.js"></script>
+    <script src="~/lib/bootstrap/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="~/lib/signalr/signalr.min.js"></script>
+    <script src="~/js/notify.js" asp-append-version="true"></script>
+    @await RenderSectionAsync("Scripts", required: false)
+</body>
+</html>

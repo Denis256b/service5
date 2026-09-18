@@ -1,0 +1,140 @@
+@{
+    ViewData["Title"] = "Отчёты";
+}
+
+<!-- Сводка по статусам -->
+<div class="row mb-4">
+    <div class="col-6 col-md">
+        <div class="card text-center">
+            <div class="card-body py-3">
+                <h6 class="text-muted mb-1">В очереди</h6>
+                <span class="display-6" id="countPending">0</span>
+            </div>
+        </div>
+    </div>
+    <div class="col-6 col-md">
+        <div class="card text-center">
+            <div class="card-body py-3">
+                <h6 class="text-muted mb-1">Выполняются</h6>
+                <span class="display-6 text-primary" id="countProcessing">0</span>
+            </div>
+        </div>
+    </div>
+    <div class="col-6 col-md">
+        <div class="card text-center">
+            <div class="card-body py-3">
+                <h6 class="text-muted mb-1">Готово</h6>
+                <span class="display-6 text-success" id="countDone">0</span>
+            </div>
+        </div>
+    </div>
+    <div class="col-6 col-md">
+        <div class="card text-center">
+            <div class="card-body py-3">
+                <h6 class="text-muted mb-1">Ошибки</h6>
+                <span class="display-6 text-danger" id="countError">0</span>
+            </div>
+        </div>
+    </div>
+    <div class="col-6 col-md">
+        <div class="card text-center">
+            <div class="card-body py-3">
+                <h6 class="text-muted mb-1">Отменено</h6>
+                <span class="display-6 text-dark" id="countCancelled">0</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+@if (User.IsInRole("sync-admins"))
+{
+    <!-- Форма создания задания -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">Новое задание</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <label for="newReportType" class="form-label">Тип отчета</label>
+                            <input type="text" class="form-control" id="newReportType" placeholder="sales" />
+                        </div>
+                        <div class="col-md-4">
+                            <label for="newProviderId" class="form-label">Провайдер (исполнитель)</label>
+                            <select class="form-select" id="newProviderId"></select>
+                        </div>
+                        <div class="col-md-4 d-flex align-items-end">
+                            <button id="btnCreateTask" class="btn btn-primary w-100">Создать задание</button>
+                        </div>
+                        <div class="col-12">
+                            <label for="newPayload" class="form-label">Параметры (payload)</label>
+                            <textarea class="form-control" id="newPayload" rows="3" placeholder='{"period": "2026-08"}'></textarea>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+<!-- Таблица заданий -->
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Задания на формирование отчётов</h5>
+            </div>
+            <div class="card-body">
+                <table id="tasksGrid" class="display" style="width:100%"></table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Модалка деталей задания -->
+<div class="modal fade" id="detailsModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Задание <span id="detailId"></span></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
+            </div>
+            <div class="modal-body">
+                <dl class="row mb-3">
+                    <dt class="col-sm-3">Тип</dt>
+                    <dd class="col-sm-9" id="detailType"></dd>
+                    <dt class="col-sm-3">Провайдер (исполнитель)</dt>
+                    <dd class="col-sm-9" id="detailProvider"></dd>
+                    <dt class="col-sm-3">Статус</dt>
+                    <dd class="col-sm-9" id="detailStatus"></dd>
+                    <dt class="col-sm-3">Повторы</dt>
+                    <dd class="col-sm-9" id="detailRetryCount"></dd>
+                </dl>
+
+                <h6 class="mb-1">Параметры (payload)</h6>
+                <pre id="detailPayload" class="bg-light p-2 rounded small mb-3"></pre>
+
+                <h6 class="mb-1">Результат</h6>
+                <pre id="detailResult" class="bg-light p-2 rounded small mb-3"></pre>
+
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <div>
+                        <h6 class="mb-1">Файл отчета</h6>
+                        <code id="detailFilePath" class="small"></code>
+                    </div>
+                    <a id="detailDownload" class="btn btn-outline-success btn-sm" download>Скачать</a>
+                </div>
+
+                <h6 class="mb-1">История событий</h6>
+                <div id="detailTimeline" class="border rounded p-2"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script>window.REPORTS_IS_ADMIN = @User.IsInRole("sync-admins").ToString().ToLowerInvariant();</script>
+    <script src="~/js/reports.js" asp-append-version="true"></script>
+}

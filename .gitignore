@@ -1,0 +1,17 @@
+bin/
+obj/
+.env
+ReportDaemon/reports/
+SyncDaemon/reports/
+SyncManager/reports/
+
+# Локальные (gitignored) файлы конфигурации — реальные строки подключения вне git
+appsettings.*.local.json
+
+# Сертификаты и ключи
+*.pfx
+*.pem
+*.key
+
+# Локальное состояние инструментария (не для публикации)
+.kilo/

@@ -1,0 +1,52 @@
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: #f5f6fa;
+}
+
+.status-badge {
+    display: inline-block;
+    padding: 12px 28px;
+    border-radius: 50px;
+    font-size: 1.2rem;
+    font-weight: bold;
+    color: #fff;
+}
+
+.status-running {
+    background-color: #28a745;
+    animation: pulse 2s infinite;
+}
+
+.status-stopped {
+    background-color: #dc3545;
+}
+
+@keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(40, 167, 69, 0.4); }
+    70%  { box-shadow: 0 0 0 14px rgba(40, 167, 69, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(40, 167, 69, 0); }
+}
+
+.card {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    border: none;
+    border-radius: 8px;
+}
+
+.card-header {
+    background-color: #fff;
+    border-bottom: 1px solid #eee;
+}
+
+.display-6 {
+    font-size: 1.8rem;
+    font-weight: 600;
+}
+
+#activityChart {
+    height: 350px;
+}
+
+#historyGrid {
+    min-height: 200px;
+}
