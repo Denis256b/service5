@@ -20,7 +20,9 @@ public sealed record AgentNotification(long EventId, string SuppressKey, string 
 /// только после закрытия предыдущего (BalloonTipClosed). Клик по уведомлению открывает
 /// Url через Process.Start (UseShellExecute). Дедупликация: одно balloon на id события;
 /// повтор того же SuppressKey внутри SuppressHours подавляется. Обращения к NotifyIcon
-/// выполняются на UI-потоке (BeginInvoke).
+/// выполняются на UI-потоке (BeginInvoke). Если Windows не прислал BalloonTipClosed
+/// (balloon «проглочен»), watchdog принудительно сбрасывает показ через
+/// BalloonMilliseconds + 5 с, чтобы очередь не застревала.
 /// </summary>
 public sealed class Notifier : IDisposable
 {
@@ -31,10 +33,17 @@ public sealed class Notifier : IDisposable
     private const int MaxTitleLength = 63;
     private const int MaxMessageLength = 255;
 
+    // Максимальная глубина очереди: при переполнении сбрасывается старейшее уведомление.
+    private const int MaxQueueDepth = 100;
+
     private readonly Form _owner;
     private readonly NotifyIcon _icon;
     private readonly Func<AgentConfig> _config;
     private readonly ConcurrentQueue<AgentNotification> _queue = new();
+
+    // Watchdog застрявшего показа (UI-поток): принудительный сброс, если Windows
+    // не прислал BalloonTipClosed (balloon «проглочен»).
+    private readonly System.Windows.Forms.Timer _watchdog;
 
     // Дедупликация: показанные id событий и время последнего показа по SuppressKey.
     private readonly object _dedupLock = new();
@@ -75,6 +84,11 @@ public sealed class Notifier : IDisposable
         };
         _icon.BalloonTipClicked += OnBalloonTipClicked;
         _icon.BalloonTipClosed += OnBalloonTipClosed;
+
+        // Конструктор вызывается на UI-потоке (Program.Main, до Application.Run) —
+        // WinForms Timer корректно привяжется к потоку сообщений.
+        _watchdog = new System.Windows.Forms.Timer { Interval = BalloonMilliseconds + 5000 };
+        _watchdog.Tick += OnWatchdogTick;
     }
 
     /// <summary>Форма-владелец: её нужно передать в Application.Run.</summary>
@@ -107,6 +121,7 @@ public sealed class Notifier : IDisposable
         var cfg = _config();
         if (!cfg.Enabled)
         {
+            AgentLog.Info($"Отклонено «{notification.Title}»: уведомления выключены");
             return; // глобальный выключатель
         }
 
@@ -115,6 +130,7 @@ public sealed class Notifier : IDisposable
             // Одно balloon на id события: повторное прочтение той же записи не показывается.
             if (!_shownEventIds.Add(notification.EventId))
             {
+                AgentLog.Info($"Отклонено «{notification.Title}»: дедупликация по EventId");
                 return;
             }
 
@@ -123,13 +139,21 @@ public sealed class Notifier : IDisposable
                 _lastShownByKey.TryGetValue(notification.SuppressKey, out var lastShown) &&
                 DateTime.UtcNow - lastShown < TimeSpan.FromHours(cfg.SuppressHours))
             {
+                AgentLog.Info($"Отклонено «{notification.Title}»: подавление повторов (SuppressHours)");
                 return;
             }
 
             _lastShownByKey[notification.SuppressKey] = DateTime.UtcNow;
         }
 
+        // Ограничение глубины очереди: сбрасываем старейшие, пока не уместится новое.
+        while (_queue.Count >= MaxQueueDepth && _queue.TryDequeue(out _))
+        {
+            AgentLog.Warn("Переполнение очереди уведомлений — сброшено старейшее");
+        }
+
         _queue.Enqueue(notification);
+        AgentLog.Info($"В очередь: {notification.Title} (в очереди: {_queue.Count})");
         TryShowNext();
     }
 
@@ -174,6 +198,9 @@ public sealed class Notifier : IDisposable
             Truncate(notification.Title, MaxTitleLength),
             Truncate(notification.Message, MaxMessageLength),
             ToolTipIcon.Warning);
+
+        // Если Windows не прислает BalloonTipClosed — watchdog сбросит показ.
+        _watchdog.Start();
     }
 
     /// <summary>Обработчик клика по balloon: фиксирует, что нужен переход по Url.</summary>
@@ -185,6 +212,14 @@ public sealed class Notifier : IDisposable
     /// </summary>
     private void OnBalloonTipClosed(object? sender, EventArgs e)
     {
+        // Опоздавшее событие после сброса watchdog (ничего не показывается):
+        // иначе был бы двойной переход к следующему.
+        if (_showing == 0)
+        {
+            _watchdog.Stop();
+            return;
+        }
+
         var current = _current;
         if (_clicked && current is { } c && !string.IsNullOrEmpty(c.Url))
         {
@@ -193,6 +228,21 @@ public sealed class Notifier : IDisposable
 
         Interlocked.Exchange(ref _showing, 0);
         TryShowNext();
+    }
+
+    /// <summary>
+    /// Tick watchdog (UI-поток): если флаг показа всё ещё стоит спустя
+    /// BalloonMilliseconds + 5 с — Windows не прислал BalloonTipClosed;
+    /// принудительно сбрасываем показ и переходим к следующему из очереди.
+    /// </summary>
+    private void OnWatchdogTick(object? sender, EventArgs e)
+    {
+        if (Interlocked.CompareExchange(ref _showing, 0, 1) == 1)
+        {
+            AgentLog.Warn("Balloon не закрылся за 15 с (Windows не прислал BalloonTipClosed) — принудительный сброс");
+            _watchdog.Stop();
+            TryShowNext();
+        }
     }
 
     /// <summary>Открывает адрес в стандартном браузере (UseShellExecute).</summary>
@@ -215,6 +265,8 @@ public sealed class Notifier : IDisposable
     /// <summary>Скрывает иконку и освобождает ресурсы.</summary>
     public void Dispose()
     {
+        _watchdog.Stop();
+        _watchdog.Dispose();
         _icon.Visible = false;
         _icon.Dispose();
         _owner.Dispose();
