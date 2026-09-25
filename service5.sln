@@ -17,6 +17,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ReportDaemon", "ReportDaemo
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SecondProvider", "SecondProvider\SecondProvider.csproj", "{6AB09F29-494F-4CD7-BF4A-98B2CBA89249}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NotifyAgent", "NotifyAgent\NotifyAgent.csproj", "{CDAD089D-2972-4FBB-8F54-17D5D2E6BC62}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -51,6 +53,10 @@ Global
 		{6AB09F29-494F-4CD7-BF4A-98B2CBA89249}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{6AB09F29-494F-4CD7-BF4A-98B2CBA89249}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{6AB09F29-494F-4CD7-BF4A-98B2CBA89249}.Release|Any CPU.Build.0 = Release|Any CPU
+		{CDAD089D-2972-4FBB-8F54-17D5D2E6BC62}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{CDAD089D-2972-4FBB-8F54-17D5D2E6BC62}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{CDAD089D-2972-4FBB-8F54-17D5D2E6BC62}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{CDAD089D-2972-4FBB-8F54-17D5D2E6BC62}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
