@@ -1,64 +1,47 @@
-using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Windows.Forms;
+using Windows.UI.Notifications;
 
 namespace NotifyAgent;
 
 /// <summary>
-/// Одно уведомление, доставляемое balloon-подсказкой в трей.
+/// Одно уведомление, доставляемое системным тостом (Windows.UI.Notifications).
 /// </summary>
 /// <param name="EventId">Уникальный id источника (Id записи SyncHistory / Id события ReportTaskEvents) — дедупликация по нему.</param>
 /// <param name="SuppressKey">Ключ подавления повторов: статус + задание (для отчётов) или тип (для синхронизации).</param>
-/// <param name="Title">Заголовок balloon-уведомления.</param>
+/// <param name="Title">Заголовок тоста.</param>
 /// <param name="Message">Текст уведомления (~200 символов).</param>
 /// <param name="Url">Адрес веб-панели для перехода по клику; пустая строка — без перехода.</param>
 public sealed record AgentNotification(long EventId, string SuppressKey, string Title, string Message, string Url);
 
 /// <summary>
-/// Доставка системных уведомлений: NotifyIcon + очередь balloon-подсказок. Показ
-/// строго по одному (событийно, без блокировки UI-потока): новое balloon показывается
-/// только после закрытия предыдущего (BalloonTipClosed). Клик по уведомлению открывает
-/// Url через Process.Start (UseShellExecute). Дедупликация: одно balloon на id события;
-/// повтор того же SuppressKey внутри SuppressHours подавляется. Обращения к NotifyIcon
-/// выполняются на UI-потоке (BeginInvoke). Если Windows не прислал BalloonTipClosed
-/// (balloon «проглочен»), watchdog принудительно сбрасывает показ через
-/// BalloonMilliseconds + 5 с, чтобы очередь не застревала.
+/// Доставка системных уведомлений: NotifyIcon (иконка в трее) + тосты Windows.UI.Notifications.
+/// Каждое принятое уведомление сразу отправляется как тост — очередь показа и тайминг
+/// управляет сама ОС (несколько тостов могут показаться одновременно, застреваний не бывает).
+/// Клик по тосту открывает Url через элемент &lt;launch&gt; в XML тоста: браузер запускает
+/// Windows, процесс агента не участвует. Дедупликация: один тост на id события; повтор того
+/// же SuppressKey внутри SuppressHours подавляется.
 /// </summary>
 public sealed class Notifier : IDisposable
 {
-    // Длительность показа одного balloon в миллисекундах.
-    private const int BalloonMilliseconds = 10000;
+    /// <summary>Идентификатор приложения (AUMID) для тостов — используется и в «уже запущен».</summary>
+    public const string AppUserModelId = "SyncBus.NotifyAgent";
 
-    // Ограничения Windows на текст balloon (заголовок и текст).
+    // Ограничения Windows на текст тоста (заголовок и текст).
     private const int MaxTitleLength = 63;
     private const int MaxMessageLength = 255;
-
-    // Максимальная глубина очереди: при переполнении сбрасывается старейшее уведомление.
-    private const int MaxQueueDepth = 100;
 
     private readonly Form _owner;
     private readonly NotifyIcon _icon;
     private readonly Func<AgentConfig> _config;
-    private readonly ConcurrentQueue<AgentNotification> _queue = new();
-
-    // Watchdog застрявшего показа (UI-поток): принудительный сброс, если Windows
-    // не прислал BalloonTipClosed (balloon «проглочен»).
-    private readonly System.Windows.Forms.Timer _watchdog;
+    private readonly ToastNotifier _toastNotifier;
 
     // Дедупликация: показанные id событий и время последнего показа по SuppressKey.
     private readonly object _dedupLock = new();
     private readonly HashSet<long> _shownEventIds = new();
     private readonly Dictionary<string, DateTime> _lastShownByKey = new();
 
-    // 1, пока какое-то balloon показывается (гарантия «по одному»).
-    private int _showing;
-
-    // Текущее balloon и флаг клика по нему (клик обрабатывается в BalloonTipClosed).
-    private AgentNotification? _current;
-    private bool _clicked;
-
     /// <summary>
-    /// Создаёт иконку в трее (скрытая форма-владелец для UI-потока).
+    /// Создаёт иконку в трее (скрытая форма-владелец) и нотификатор тостов.
     /// </summary>
     /// <param name="icon">Иконка NotifyIcon.</param>
     /// <param name="config">Доступ к актуальному конфигу (SuppressHours/Enabled читаются на каждое уведомление).</param>
@@ -73,7 +56,7 @@ public sealed class Notifier : IDisposable
             Size = new System.Drawing.Size(0, 0),
             StartPosition = FormStartPosition.Manual
         };
-        // Создаём handle сразу: BeginInvoke работает и до старта цикла сообщений.
+        // Создаём handle сразу: форма нужна как owner для ShowDialog в SettingsForm.
         _owner.CreateControl();
 
         _icon = new NotifyIcon
@@ -82,13 +65,9 @@ public sealed class Notifier : IDisposable
             Text = "NotifyAgent — уведомления SyncBus",
             Visible = true
         };
-        _icon.BalloonTipClicked += OnBalloonTipClicked;
-        _icon.BalloonTipClosed += OnBalloonTipClosed;
 
-        // Конструктор вызывается на UI-потоке (Program.Main, до Application.Run) —
-        // WinForms Timer корректно привяжется к потоку сообщений.
-        _watchdog = new System.Windows.Forms.Timer { Interval = BalloonMilliseconds + 5000 };
-        _watchdog.Tick += OnWatchdogTick;
+        // Доставка тостами: очередь показа и тайминг ведёт Windows; вызовы WinRT потокобезопасны.
+        _toastNotifier = ToastNotificationManager.CreateToastNotifier(AppUserModelId);
     }
 
     /// <summary>Форма-владелец: её нужно передать в Application.Run.</summary>
@@ -112,8 +91,8 @@ public sealed class Notifier : IDisposable
     }
 
     /// <summary>
-    /// Проверяет фильтры/дедупликацию и ставит уведомление в очередь показа.
-    /// Может вызываться с любого потока (очередь и дедупликация потокобезопасны).
+    /// Проверяет фильтры/дедупликацию и сразу отправляет уведомление тостом.
+    /// Может вызываться с любого потока (дедупликация под замком, вызовы WinRT потокобезопасны).
     /// </summary>
     /// <param name="notification">Уведомление для доставки.</param>
     public void Enqueue(AgentNotification notification)
@@ -127,7 +106,7 @@ public sealed class Notifier : IDisposable
 
         lock (_dedupLock)
         {
-            // Одно balloon на id события: повторное прочтение той же записи не показывается.
+            // Один тост на id события: повторное прочтение той же записи не показывается.
             if (!_shownEventIds.Add(notification.EventId))
             {
                 AgentLog.Info($"Отклонено «{notification.Title}»: дедупликация по EventId");
@@ -146,127 +125,51 @@ public sealed class Notifier : IDisposable
             _lastShownByKey[notification.SuppressKey] = DateTime.UtcNow;
         }
 
-        // Ограничение глубины очереди: сбрасываем старейшие, пока не уместится новое.
-        while (_queue.Count >= MaxQueueDepth && _queue.TryDequeue(out _))
-        {
-            AgentLog.Warn("Переполнение очереди уведомлений — сброшено старейшее");
-        }
-
-        _queue.Enqueue(notification);
-        AgentLog.Info($"В очередь: {notification.Title} (в очереди: {_queue.Count})");
-        TryShowNext();
-    }
-
-    /// <summary>
-    /// Показывает следующее уведомление на UI-потоке, если сейчас ничего не показывается.
-    /// Событийно: закрытие текущего balloon (BalloonTipClosed) вызывает этот метод снова.
-    /// </summary>
-    private void TryShowNext()
-    {
-        if (!_owner.IsHandleCreated || _owner.IsDisposed)
-        {
-            return;
-        }
-
-        _owner.BeginInvoke(new Action(() =>
-        {
-            // Пока одно balloon активно — следующее ждёт в очереди.
-            if (Interlocked.CompareExchange(ref _showing, 1, 0) != 0)
-            {
-                return;
-            }
-
-            if (!_queue.TryDequeue(out var notification))
-            {
-                Interlocked.Exchange(ref _showing, 0); // очередь пуста — снимаем флаг
-                return;
-            }
-
-            ShowOne(notification);
-        }));
-    }
-
-    /// <summary>Показывает одно balloon. Выполняется на UI-потоке.</summary>
-    private void ShowOne(AgentNotification notification)
-    {
-        _current = notification;
-        _clicked = false;
-
-        AgentLog.Info($"Уведомление: {notification.Title}");
-        _icon.ShowBalloonTip(
-            BalloonMilliseconds,
-            Truncate(notification.Title, MaxTitleLength),
-            Truncate(notification.Message, MaxMessageLength),
-            ToolTipIcon.Warning);
-
-        // Если Windows не прислает BalloonTipClosed — watchdog сбросит показ.
-        _watchdog.Start();
-    }
-
-    /// <summary>Обработчик клика по balloon: фиксирует, что нужен переход по Url.</summary>
-    private void OnBalloonTipClicked(object? sender, EventArgs e) => _clicked = true;
-
-    /// <summary>
-    /// Обработчик закрытия balloon (клик или истечение времени): при клике открывает
-    /// Url, снимает флаг показа и показывает следующее из очереди.
-    /// </summary>
-    private void OnBalloonTipClosed(object? sender, EventArgs e)
-    {
-        // Опоздавшее событие после сброса watchdog (ничего не показывается):
-        // иначе был бы двойной переход к следующему.
-        if (_showing == 0)
-        {
-            _watchdog.Stop();
-            return;
-        }
-
-        var current = _current;
-        if (_clicked && current is { } c && !string.IsNullOrEmpty(c.Url))
-        {
-            OpenUrl(c.Url);
-        }
-
-        Interlocked.Exchange(ref _showing, 0);
-        TryShowNext();
-    }
-
-    /// <summary>
-    /// Tick watchdog (UI-поток): если флаг показа всё ещё стоит спустя
-    /// BalloonMilliseconds + 5 с — Windows не прислал BalloonTipClosed;
-    /// принудительно сбрасываем показ и переходим к следующему из очереди.
-    /// </summary>
-    private void OnWatchdogTick(object? sender, EventArgs e)
-    {
-        if (Interlocked.CompareExchange(ref _showing, 0, 1) == 1)
-        {
-            AgentLog.Warn("Balloon не закрылся за 15 с (Windows не прислал BalloonTipClosed) — принудительный сброс");
-            _watchdog.Stop();
-            TryShowNext();
-        }
-    }
-
-    /// <summary>Открывает адрес в стандартном браузере (UseShellExecute).</summary>
-    private static void OpenUrl(string url)
-    {
         try
         {
-            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            // Системная очередь Windows: несколько тостов могут показаться одновременно.
+            _toastNotifier.Show(BuildToast(notification));
+            AgentLog.Info($"Тост отправлен: {notification.Title}");
         }
         catch (Exception ex)
         {
-            AgentLog.Warn($"Не удалось открыть {url}: {ex.Message}");
+            AgentLog.Warn($"Не удалось отправить тост «{notification.Title}»: {ex.Message}");
         }
     }
 
-    /// <summary>Обрезает строку до maxLength (ограничения Windows на текст balloon).</summary>
+    /// <summary>
+    /// Собирает XML тоста: шаблон ToastText02 (заголовок + текст); при непустом Url
+    /// добавляет элемент &lt;launch ActivationType="protocol" QueryParameters="{url}"/&gt; —
+    /// по клику Windows откроет адрес в стандартном браузере.
+    /// </summary>
+    private static ToastNotification BuildToast(AgentNotification notification)
+    {
+        var template = ToastContentManager.CreateToastTemplate(ToastTemplateType.ToastText02);
+
+        // Два элемента <text> шаблона: заголовок и текст. DOM экранирует значения
+        // текстовых узлов и атрибутов при сериализации — ручное экранирование не нужно.
+        var texts = template.GetElementsByTagName("text");
+        texts[0].AppendChild(template.CreateTextNode(Truncate(notification.Title, MaxTitleLength)));
+        texts[1].AppendChild(template.CreateTextNode(Truncate(notification.Message, MaxMessageLength)));
+
+        if (!string.IsNullOrEmpty(notification.Url))
+        {
+            var launch = template.CreateElement("launch");
+            launch.SetAttribute("ActivationType", "protocol");
+            launch.SetAttribute("QueryParameters", notification.Url);
+            template.AppendChild(launch);
+        }
+
+        return new ToastNotification(template.Xml);
+    }
+
+    /// <summary>Обрезает строку до maxLength (ограничения Windows на текст тоста).</summary>
     private static string Truncate(string value, int maxLength) =>
         value.Length <= maxLength ? value : value[..maxLength];
 
     /// <summary>Скрывает иконку и освобождает ресурсы.</summary>
     public void Dispose()
     {
-        _watchdog.Stop();
-        _watchdog.Dispose();
         _icon.Visible = false;
         _icon.Dispose();
         _owner.Dispose();

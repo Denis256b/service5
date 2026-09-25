@@ -1,4 +1,5 @@
 using System.Windows.Forms;
+using Windows.UI.Notifications;
 
 namespace NotifyAgent;
 
@@ -18,7 +19,11 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
-        ApplicationConfiguration.Initialize();
+        // Ручная инициализация вместо ApplicationConfiguration.Initialize():
+        // source-generated класс генерируется только для net6.0-windows+; дефолты
+        // (SystemAware DPI, Segoe UI 9pt) совпадают с автогенерируемым вызовом.
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
 
         var baseDir = AppContext.BaseDirectory;
         var configPath = Path.Combine(baseDir, "agent.json");
@@ -68,25 +73,23 @@ internal static class Program
     }
 
     /// <summary>
-    /// Повторный запуск: временная иконка в трее показывает balloon «уже запущен»,
-    /// через несколько секунд процесс завершается.
+    /// Повторный запуск: тост «уже запущен» (тот же AUMID, что у агента),
+    /// через несколько секунд процесс завершается сам.
     /// </summary>
     private static void ShowAlreadyRunningAndExit()
     {
-        var icon = new NotifyIcon
-        {
-            Icon = LoadIcon(),
-            Text = "NotifyAgent",
-            Visible = true
-        };
-        icon.ShowBalloonTip(5000, "NotifyAgent", "Агент уже запущен — иконка в трее.", ToolTipIcon.Info);
+        var notifier = ToastNotificationManager.CreateToastNotifier(Notifier.AppUserModelId);
 
-        // Цикл сообщений без окна: таймер завершает процесс через 6 с (показ balloon).
-        using var timer = new System.Windows.Forms.Timer { Interval = 6000 };
-        timer.Tick += (_, _) => Application.Exit();
-        timer.Start();
-        Application.Run();
-        icon.Dispose();
+        // Шаблон ToastText02 (заголовок + текст), без launch — переход не нужен.
+        var template = ToastContentManager.CreateToastTemplate(ToastTemplateType.ToastText02);
+        var texts = template.GetElementsByTagName("text");
+        texts[0].AppendChild(template.CreateTextNode("NotifyAgent"));
+        texts[1].AppendChild(template.CreateTextNode("Агент уже запущен — иконка в трее."));
+
+        notifier.Show(new ToastNotification(template.Xml));
+
+        // Даём Windows показать тост (~5 с), затем завершаем процесс.
+        Thread.Sleep(6000);
     }
 
     /// <summary>
