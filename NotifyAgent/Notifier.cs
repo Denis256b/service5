@@ -12,7 +12,11 @@ namespace NotifyAgent;
 /// <param name="Title">Заголовок balloon-уведомления.</param>
 /// <param name="Message">Текст уведомления (~200 символов).</param>
 /// <param name="Url">Адрес веб-панели для перехода по клику; пустая строка — без перехода.</param>
-public sealed record AgentNotification(long EventId, string SuppressKey, string Title, string Message, string Url);
+public sealed record AgentNotification(long EventId, string SuppressKey, string Title, string Message, string Url)
+{
+    /// <summary>Время постановки в очередь (UtcNow) — для колонки «Время» сводного окна.</summary>
+    public DateTime EnqueuedAt { get; init; } = DateTime.UtcNow;
+}
 
 /// <summary>
 /// Доставка системных уведомлений: NotifyIcon + очередь balloon-подсказок. Показ
@@ -24,6 +28,11 @@ public sealed record AgentNotification(long EventId, string SuppressKey, string 
 /// выполняются на UI-потоке (BeginInvoke). Если Windows не прислал BalloonTipClosed
 /// (balloon «проглочен»), watchdog принудительно сбрасывает показ через
 /// BalloonMilliseconds + 5 с, чтобы очередь не застревала.
+///
+/// Дополнительно: немодальная форма статуса при обрыве/восстановлении соединения
+/// с БД (<see cref="ReportConnectionLost"/>, <see cref="ReportConnectionRestored"/>);
+/// пока экран заблокирован, показ balloon ставится на паузу, а накопившиеся
+/// уведомления показываются сводным окном при разблокировке.
 /// </summary>
 public sealed class Notifier : IDisposable
 {
@@ -37,10 +46,17 @@ public sealed class Notifier : IDisposable
     // Максимальная глубина очереди: при переполнении сбрасывается старейшее уведомление.
     private const int MaxQueueDepth = 100;
 
-    private readonly Form _owner;
+    // Форма-владелец: UI-поток + регистрация уведомления о блокировке сессии Windows.
+    private readonly SessionAwareForm _owner;
     private readonly NotifyIcon _icon;
     private readonly Func<AgentConfig> _config;
     private readonly ConcurrentQueue<AgentNotification> _queue = new();
+
+    // Немодальная форма статуса соединения (создаётся по первому обрыву).
+    private ConnectionStatusForm? _connectionStatusForm;
+
+    // Пока экран заблокирован — показ balloon на паузе (баллоны всё равно не видны).
+    private bool _sessionLocked;
 
     // Watchdog застрявшего показа (UI-поток): принудительный сброс, если Windows
     // не прислал BalloonTipClosed (balloon «проглочен»).
@@ -66,17 +82,15 @@ public sealed class Notifier : IDisposable
     {
         _config = config;
 
-        _owner = new Form
-        {
-            ShowInTaskbar = false,
-            Visible = false,
-            Size = new System.Drawing.Size(0, 0),
-            StartPosition = FormStartPosition.Manual
-        };
-        // Создаём handle сразу на UI-потоке: BeginInvoke работает и до старта цикла сообщений.
+        _owner = new SessionAwareForm();
+        // Создаём handle сразу на UI-потоке: BeginInvoke работает и до старта цикла сообщений,
+        // а OnHandleCreated регистрирует уведомление о блокировке сессии (WTSRegisterSessionNotification).
         // CreateControl() не подходит — для невидимой формы (Visible = false) WinForms
         // откладывает создание handle, поэтому обращаемся к Handle напрямую.
         _ = _owner.Handle;
+
+        // События блокировки/разблокировки приходят на UI-потоке (WndProc).
+        _owner.SessionChanged += OnSessionChanged;
 
         _icon = new NotifyIcon
         {
@@ -154,8 +168,98 @@ public sealed class Notifier : IDisposable
             AgentLog.Warn("Переполнение очереди уведомлений — сброшено старейшее");
         }
 
+        notification = notification with { EnqueuedAt = DateTime.UtcNow };
         _queue.Enqueue(notification);
         AgentLog.Info($"В очередь: {notification.Title} (в очереди: {_queue.Count})");
+        TryShowNext();
+    }
+
+    /// <summary>
+    /// Показывает форму статуса при обрыве соединения с БД. Может вызываться с фонового
+    /// потока (EventListener) — мarshal через <c>_owner.BeginInvoke</c>.
+    /// </summary>
+    /// <param name="reason">Текст причины обрыва (для лога).</param>
+    public void ReportConnectionLost(string reason)
+    {
+        if (!_owner.IsHandleCreated || _owner.IsDisposed)
+        {
+            return;
+        }
+
+        AgentLog.Warn($"Соединение с БД потеряно: {reason}");
+        _owner.BeginInvoke(new Action(ShowConnectionLost));
+    }
+
+    /// <summary>
+    /// Отмечает восстановление соединения с БД. Может вызываться с фонового потока
+    /// (EventListener) — мarshal через <c>_owner.BeginInvoke</c>.
+    /// </summary>
+    public void ReportConnectionRestored()
+    {
+        if (!_owner.IsHandleCreated || _owner.IsDisposed)
+        {
+            return;
+        }
+
+        AgentLog.Info("Соединение с БД восстановлено");
+        _owner.BeginInvoke(new Action(ShowConnectionRestored));
+    }
+
+    /// <summary>Показывает форму статуса обрыва (UI-поток). Повторный обрыв — no-op.</summary>
+    private void ShowConnectionLost()
+    {
+        // Повторный обрыв при уже открытой форме — не спамим.
+        if (_connectionStatusForm is { Visible: true })
+        {
+            return;
+        }
+
+        _connectionStatusForm ??= new ConnectionStatusForm(_owner);
+        _connectionStatusForm.ShowLost();
+    }
+
+    /// <summary>Переключает форму на «восстановлено» (UI-поток). Форма не показана — no-op.</summary>
+    private void ShowConnectionRestored()
+    {
+        // Первый старт: формы нет/не показана — восстанавливать нечего.
+        if (_connectionStatusForm is not { Visible: true })
+        {
+            return;
+        }
+
+        _connectionStatusForm.ShowRestored();
+    }
+
+    /// <summary>
+    /// Обработчик блокировки/разблокировки экрана (UI-поток, WndProc). При блокировке —
+    /// пауза показа; при разблокировке — дренируем очередь и показываем сводное окно.
+    /// </summary>
+    private void OnSessionChanged(SessionLockState state)
+    {
+        if (state == SessionLockState.Locked)
+        {
+            _sessionLocked = true;
+            AgentLog.Info("Экран заблокирован — показ уведомлений поставлен на паузу");
+            return;
+        }
+
+        // Разблокировка: снимаем паузу.
+        _sessionLocked = false;
+        AgentLog.Info("Экран разблокирован — показываем накопившиеся уведомления");
+
+        var missed = new List<AgentNotification>();
+        while (_queue.TryDequeue(out var n))
+        {
+            missed.Add(n);
+        }
+
+        if (missed.Count > 0)
+        {
+            AgentLog.Info($"Накопилось уведомлений за время блокировки: {missed.Count}");
+            new MissedNotificationsForm(missed, _config().Web.BaseUrl, _owner).Show();
+        }
+
+        // Новые уведомления после разблокировки показываются как обычно.
         TryShowNext();
     }
 
@@ -172,6 +276,12 @@ public sealed class Notifier : IDisposable
 
         _owner.BeginInvoke(new Action(() =>
         {
+            // Пока экран заблокирован — не вытаскиваем из очереди (баллоны всё равно не видны).
+            if (_sessionLocked)
+            {
+                return;
+            }
+
             // Пока одно balloon активно — следующее ждёт в очереди.
             if (Interlocked.CompareExchange(ref _showing, 1, 0) != 0)
             {
@@ -299,6 +409,80 @@ public sealed class Notifier : IDisposable
         _watchdog.Dispose();
         _icon.Visible = false;
         _icon.Dispose();
+        _connectionStatusForm?.Dispose();
+        _owner.SessionChanged -= OnSessionChanged;
         _owner.Dispose();
+    }
+
+    /// <summary>Состояние сессии Windows (блокировка/разблокировка экрана).</summary>
+    private enum SessionLockState
+    {
+        Locked,
+        Unlocked
+    }
+
+    /// <summary>
+    /// Скрытая форма-владелец: UI-поток для BeginInvoke + регистрация уведомления о
+    /// блокировке сессии Windows. В <c>OnHandleCreated</c> вызывает
+    /// <c>WTSRegisterSessionNotification(Handle, NOTIFY_FOR_THIS_SESSION)</c>; override
+    /// <c>WndProc</c> перехватывает <c>WM_WTSSESSION_CHANGE</c> (0x02B1) с причинами
+    /// <c>WTSSESSION_LOCK</c> (7) / <c>WTSSESSION_UNLOCK</c> (8) и поднимает событие.
+    /// </summary>
+    private sealed class SessionAwareForm : Form
+    {
+        // WM_WTSSESSION_CHANGE.
+        private const int WmWtsSessionChange = 0x02B1;
+
+        // Причины смены состояния сессии (winsta0.dll).
+        private const int WtsSessionLock = 7;
+        private const int WtsSessionUnlock = 8;
+
+        /// <summary>Событие блокировки/разблокировки экрана (поднимается на UI-потоке).</summary>
+        public event Action<SessionLockState>? SessionChanged;
+
+        public SessionAwareForm()
+        {
+            ShowInTaskbar = false;
+            Visible = false;
+            Size = new System.Drawing.Size(0, 0);
+            StartPosition = FormStartPosition.Manual;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            // NOTIFY_FOR_THIS_SESSION = 0x0000.
+            WTSRegisterSessionNotification(Handle, 0x0000);
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            WTSUnregisterSessionNotification(Handle);
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WmWtsSessionChange)
+            {
+                var reason = (int)m.WParam;
+                if (reason == WtsSessionLock)
+                {
+                    SessionChanged?.Invoke(SessionLockState.Locked);
+                }
+                else if (reason == WtsSessionUnlock)
+                {
+                    SessionChanged?.Invoke(SessionLockState.Unlocked);
+                }
+            }
+
+            base.WndProc(ref m);
+        }
+
+        [System.Runtime.InteropServices.DllImport("winsta0.dll", SetLastError = true)]
+        private static extern bool WTSRegisterSessionNotification(IntPtr hWnd, uint dwFlags);
+
+        [System.Runtime.InteropServices.DllImport("winsta0.dll", SetLastError = true)]
+        private static extern bool WTSUnregisterSessionNotification(IntPtr hWnd);
     }
 }

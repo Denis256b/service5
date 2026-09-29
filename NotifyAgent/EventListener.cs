@@ -6,20 +6,17 @@ namespace NotifyAgent;
 /// <summary>
 /// Слушатель событий агента: постоянное соединение LISTEN/NOTIFY на каналах
 /// <c>sync_ui_changes</c> и <c>report_tasks</c> (паттерн DbChangeListener /
-/// ReportNotificationListener) + резервные тики каждые 30 с. Уведомление или
-/// тайк будит чтение новых событий по курсорам: SyncHistory — по Id,
+/// ReportNotificationListener). Каждое NOTIFY и catch-up сразу после
+/// (пере)подключения будят чтение новых событий по курсорам: SyncHistory — по Id,
 /// ReportTaskEvents — по кортежу (Timestamp, Id). Разрешённые события фильтруются
-/// по настройкам и передаются в Notifier. При обрыве соединения переподключение
-/// через 5 с; опрос идёт на отдельном короткоживущем соединении (команды нельзя
-/// выполнять поверх зависшего WaitAsync того же соединения).
+/// по настройкам и передаются в Notifier. При обрыве соединения показывается форма
+/// статуса, переподключение через 5 с; опрос идёт на отдельном короткоживущем
+/// соединении (команды нельзя выполнять поверх зависшего WaitAsync того же соединения).
 /// </summary>
 public sealed class EventListener : IDisposable
 {
     private const string SyncUiChangesChannel = "sync_ui_changes";
     private const string ReportTasksChannel = "report_tasks";
-
-    // Резервный тик: чтение новых событий, если pg_notify не пришло (или потеряно).
-    private static readonly TimeSpan TickInterval = TimeSpan.FromSeconds(30);
 
     // Задержка переподключения при обрыве соединения LISTEN/NOTIFY.
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
@@ -36,7 +33,7 @@ public sealed class EventListener : IDisposable
     private readonly Task _loopTask;
 
     /// <summary>
-    /// Создаёт слушатель и запускает фоновый цикл (LISTEN/NOTIFY + тики).
+    /// Создаёт слушатель и запускает фоновый цикл (LISTEN/NOTIFY + catch-up по курсорам).
     /// </summary>
     /// <param name="config">Доступ к актуальному конфигу (фильтры читаются на каждое событие).</param>
     /// <param name="state">Состояние курсоров; сохраняется в файл после каждого опроса.</param>
@@ -50,7 +47,7 @@ public sealed class EventListener : IDisposable
         _connectionString = config().Db.ConnectionString;
         _statePath = statePath;
 
-        AgentLog.Info("Слушатель событий запущен (каналы: sync_ui_changes, report_tasks; тик 30 с)");
+        AgentLog.Info("Слушатель событий запущен (каналы: sync_ui_changes, report_tasks; доставка по NOTIFY + catch-up)");
         _loopTask = Task.Run(() => RunAsync(_cts.Token));
     }
 
@@ -72,7 +69,8 @@ public sealed class EventListener : IDisposable
 
     /// <summary>
     /// Основной цикл: держит соединение LISTEN/NOTIFY; обрыв → переподключение
-    /// через 5 с. Каждый тик или уведомление запускает опрос новых событий.
+    /// через 5 с. Catch-up сразу после (пере)подключения и каждое NOTIFY запускают
+    /// опрос новых событий по курсорам.
     /// </summary>
     private async Task RunAsync(CancellationToken ct)
     {
@@ -93,11 +91,14 @@ public sealed class EventListener : IDisposable
                 }
 
                 AgentLog.Info("Подписка на каналы sync_ui_changes, report_tasks установлена");
+                _notifier.ReportConnectionRestored();
 
-                // Ожидание ведёт одна долгоживущая задача WaitAsync(token), тайм-аут
-                // эмулируется Task.Delay (паттерн DbChangeListener). Задачу нельзя
-                // пересоздавать, пока старая ещё не завершилась: второй параллельный
-                // вызов WaitAsync на том же соединении запрещён.
+                // Catch-up сразу после (пере)подключения: читаем всё накопленное по курсорам.
+                await PollEventsSafeAsync(ct);
+
+                // Ожидание ведёт одна долгоживущая задача WaitAsync(token). Задачу нельзя
+                // пересоздавать, пока старая ещё не завершилась: второй параллельный вызов
+                // WaitAsync на том же соединении запрещён. Тайм-аута нет — доставка только по NOTIFY.
                 var waitTask = listenConnection.WaitAsync(ct);
 
                 while (!ct.IsCancellationRequested)
@@ -107,18 +108,12 @@ public sealed class EventListener : IDisposable
                         throw new InvalidOperationException("Соединение LISTEN/NOTIFY закрыто");
                     }
 
-                    // Ждём асинхронное сообщение или тайк, что наступит раньше.
-                    var completed = await Task.WhenAny(waitTask, Task.Delay(TickInterval, ct));
+                    // Ждём асинхронное сообщение (NOTIFY). Исключение здесь означает обрыв
+                    // соединения или отмену — их обрабатывает внешний цикл.
+                    await waitTask;
+                    waitTask = listenConnection.WaitAsync(ct); // старая задача уже завершена
 
-                    if (completed == waitTask)
-                    {
-                        // Дожидаемся результата ожидания: исключение здесь означает обрыв
-                        // соединения или отмену — их обрабатывает внешний цикл.
-                        await waitTask;
-                        waitTask = listenConnection.WaitAsync(ct); // старая задача уже завершена
-                    }
-
-                    // Тайк или уведомление — читаем новые события (на отдельном соединении).
+                    // Уведомление — читаем новые события (на отдельном соединении).
                     await PollEventsSafeAsync(ct);
                 }
             }
@@ -129,6 +124,7 @@ public sealed class EventListener : IDisposable
             catch (Exception ex)
             {
                 AgentLog.Warn($"Соединение LISTEN/NOTIFY разорвано — переподключение через 5 с: {ex.Message}");
+                _notifier.ReportConnectionLost(ex.Message);
 
                 try
                 {
@@ -150,7 +146,7 @@ public sealed class EventListener : IDisposable
 
     /// <summary>
     /// Опрос новых событий на отдельном короткоживущем соединении. Ошибка чтения
-    /// логируется и не роняет слушатель (следующий тик повторит попытку).
+    /// логируется и не роняет слушатель (следующее NOTIFY или переподключение повторит попытку).
     /// </summary>
     private async Task PollEventsSafeAsync(CancellationToken ct)
     {
@@ -254,8 +250,7 @@ public sealed class EventListener : IDisposable
 
     /// <summary>
     /// Читает новые события аудита ReportTaskEvents по курсору (Timestamp, Id).
-    /// Каждое событие = один переход статуса задания; текст ошибки берётся из
-    /// Message. Статусы заданий фиксируются в мапе состояния.
+    /// Каждое событие = один переход статуса задания; текст ошибки берётся из Message.
     /// </summary>
     private async Task PollReportTaskEventsAsync(NpgsqlConnection connection, CancellationToken ct)
     {
@@ -282,7 +277,6 @@ public sealed class EventListener : IDisposable
 
             _state.LastSeenEventTimestamp = timestamp;
             _state.LastSeenEventId = id;
-            _state.TaskStatuses[taskId] = status;
 
             RaiseReportEvent(id, taskId, status, message);
         }

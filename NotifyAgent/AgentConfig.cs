@@ -93,7 +93,9 @@ public class DbSettings
 {
     /// <summary>
     /// Строка подключения к syncbus (та же, что у демонов). Отдельную read-only
-    /// роль PostgreSQL — на будущее.
+    /// роль PostgreSQL — на будущее. <c>KeepAlive=60</c> и <c>CommandTimeout=15</c>
+    /// по умолчанию: без тиков единственный риск «немых» обрывов закрывается TCP
+    /// keepalive — мёртвое соединение даст исключение → переподключение + форма статуса.
     /// </summary>
-    public string ConnectionString { get; set; } = "Host=localhost;Database=syncbus;Username=postgres;Password=postgres";
+    public string ConnectionString { get; set; } = "Host=localhost;Database=syncbus;Username=postgres;Password=postgres;KeepAlive=60;CommandTimeout=15";
 }

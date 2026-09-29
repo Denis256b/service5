@@ -3,9 +3,10 @@ using System.Text.Json;
 namespace NotifyAgent;
 
 /// <summary>
-/// Локальное состояние агента: курсоры прочитанных событий + мапа статусов
-/// заданий отчётов. Хранится в state.json рядом с exe — перезапуск агента не
-/// повторяет старые события (baseline-логика как в текущем вебе).
+/// Локальное состояние агента: курсоры прочитанных событий. Хранится в state.json
+/// рядом с exe — перезапуск агента не повторяет старые события (baseline-логика как
+/// в текущем вебе). Старый файл с полем taskStatuses десериализуется безопасно
+/// (System.Text.Json игнорирует неизвестные свойства) — миграция не нужна.
 /// </summary>
 public class EventState
 {
@@ -28,9 +29,6 @@ public class EventState
     /// сравнение (Timestamp, Id) > (курсорTs, курсорId)).
     /// </summary>
     public long LastSeenEventId { get; set; }
-
-    /// <summary>Мапа статусов заданий отчётов: TaskId → последний известный Status.</summary>
-    public Dictionary<long, string> TaskStatuses { get; set; } = new();
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
