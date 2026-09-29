@@ -46,8 +46,8 @@ public sealed class Notifier : IDisposable
     // Максимальная глубина очереди: при переполнении сбрасывается старейшее уведомление.
     private const int MaxQueueDepth = 100;
 
-    // Форма-владелец: UI-поток + регистрация уведомления о блокировке сессии Windows.
-    private readonly SessionAwareForm _owner;
+    // Скрытая форма-владелец: UI-поток для BeginInvoke.
+    private readonly Form _owner;
     private readonly NotifyIcon _icon;
     private readonly Func<AgentConfig> _config;
     private readonly ConcurrentQueue<AgentNotification> _queue = new();
@@ -82,15 +82,20 @@ public sealed class Notifier : IDisposable
     {
         _config = config;
 
-        _owner = new SessionAwareForm();
-        // Создаём handle сразу на UI-потоке: BeginInvoke работает и до старта цикла сообщений,
-        // а OnHandleCreated регистрирует уведомление о блокировке сессии (WTSRegisterSessionNotification).
-        // CreateControl() не подходит — для невидимой формы (Visible = false) WinForms
-        // откладывает создание handle, поэтому обращаемся к Handle напрямую.
+        _owner = new Form
+        {
+            ShowInTaskbar = false,
+            Visible = false,
+            Size = new System.Drawing.Size(0, 0),
+            StartPosition = FormStartPosition.Manual
+        };
+        // Создаём handle сразу на UI-потоке: BeginInvoke работает и до старта цикла сообщений.
         _ = _owner.Handle;
 
-        // События блокировки/разблокировки приходят на UI-потоке (WndProc).
-        _owner.SessionChanged += OnSessionChanged;
+        // Подписка выполняется на UI-потоке (конструктор вызывается из Program.Main):
+        // внутреннее окно SystemEvents создаётся на этом потоке, поэтому события
+        // SessionSwitch приходят на UI-потоке.
+        SystemEvents.SessionSwitch += OnSessionSwitch;
 
         _icon = new NotifyIcon
         {
@@ -231,16 +236,22 @@ public sealed class Notifier : IDisposable
     }
 
     /// <summary>
-    /// Обработчик блокировки/разблокировки экрана (UI-поток, WndProc). При блокировке —
-    /// пауза показа; при разблокировке — дренируем очередь и показываем сводное окно.
+    /// Обработчик смены состояния сессии Windows (UI-поток, SystemEvents.SessionSwitch).
+    /// При блокировке — пауза показа; при разблокировке — дренируем очередь и показываем
+    /// сводное окно. Прочие причины (Logon/Logout/Remote*) игнорируются.
     /// </summary>
-    private void OnSessionChanged(SessionLockState state)
+    private void OnSessionSwitch(object? sender, SessionSwitchEventArgs e)
     {
-        if (state == SessionLockState.Locked)
+        if (e.Reason == SessionSwitchReason.SessionLock)
         {
             _sessionLocked = true;
             AgentLog.Info("Экран заблокирован — показ уведомлений поставлен на паузу");
             return;
+        }
+
+        if (e.Reason != SessionSwitchReason.SessionUnlock)
+        {
+            return; // Logon/Logout/RemoteConnect/RemoteDisconnect — не наше дело
         }
 
         // Разблокировка: снимаем паузу.
@@ -410,79 +421,7 @@ public sealed class Notifier : IDisposable
         _icon.Visible = false;
         _icon.Dispose();
         _connectionStatusForm?.Dispose();
-        _owner.SessionChanged -= OnSessionChanged;
+        SystemEvents.SessionSwitch -= OnSessionSwitch;
         _owner.Dispose();
-    }
-
-    /// <summary>Состояние сессии Windows (блокировка/разблокировка экрана).</summary>
-    private enum SessionLockState
-    {
-        Locked,
-        Unlocked
-    }
-
-    /// <summary>
-    /// Скрытая форма-владелец: UI-поток для BeginInvoke + регистрация уведомления о
-    /// блокировке сессии Windows. В <c>OnHandleCreated</c> вызывает
-    /// <c>WTSRegisterSessionNotification(Handle, NOTIFY_FOR_THIS_SESSION)</c>; override
-    /// <c>WndProc</c> перехватывает <c>WM_WTSSESSION_CHANGE</c> (0x02B1) с причинами
-    /// <c>WTSSESSION_LOCK</c> (7) / <c>WTSSESSION_UNLOCK</c> (8) и поднимает событие.
-    /// </summary>
-    private sealed class SessionAwareForm : Form
-    {
-        // WM_WTSSESSION_CHANGE.
-        private const int WmWtsSessionChange = 0x02B1;
-
-        // Причины смены состояния сессии (winsta0.dll).
-        private const int WtsSessionLock = 7;
-        private const int WtsSessionUnlock = 8;
-
-        /// <summary>Событие блокировки/разблокировки экрана (поднимается на UI-потоке).</summary>
-        public event Action<SessionLockState>? SessionChanged;
-
-        public SessionAwareForm()
-        {
-            ShowInTaskbar = false;
-            Visible = false;
-            Size = new System.Drawing.Size(0, 0);
-            StartPosition = FormStartPosition.Manual;
-        }
-
-        protected override void OnHandleCreated(EventArgs e)
-        {
-            base.OnHandleCreated(e);
-            // NOTIFY_FOR_THIS_SESSION = 0x0000.
-            WTSRegisterSessionNotification(Handle, 0x0000);
-        }
-
-        protected override void OnHandleDestroyed(EventArgs e)
-        {
-            WTSUnregisterSessionNotification(Handle);
-            base.OnHandleDestroyed(e);
-        }
-
-        protected override void WndProc(ref Message m)
-        {
-            if (m.Msg == WmWtsSessionChange)
-            {
-                var reason = (int)m.WParam;
-                if (reason == WtsSessionLock)
-                {
-                    SessionChanged?.Invoke(SessionLockState.Locked);
-                }
-                else if (reason == WtsSessionUnlock)
-                {
-                    SessionChanged?.Invoke(SessionLockState.Unlocked);
-                }
-            }
-
-            base.WndProc(ref m);
-        }
-
-        [System.Runtime.InteropServices.DllImport("winsta0.dll", SetLastError = true)]
-        private static extern bool WTSRegisterSessionNotification(IntPtr hWnd, uint dwFlags);
-
-        [System.Runtime.InteropServices.DllImport("winsta0.dll", SetLastError = true)]
-        private static extern bool WTSUnregisterSessionNotification(IntPtr hWnd);
     }
 }
